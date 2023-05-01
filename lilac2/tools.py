@@ -9,7 +9,7 @@ from contextlib import suppress
 
 import tomli
 
-from .const import mydir
+from .const import lilacdir
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ def kill_child_processes() -> None:
 
 
 def read_config() -> Dict[str, Any]:
-    config_file = mydir / 'config.toml'
+    config_file = lilacdir / 'config.toml'
     with open(config_file, 'rb') as f:
         return tomli.load(f)
 

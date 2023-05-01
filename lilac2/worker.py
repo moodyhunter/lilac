@@ -27,7 +27,7 @@ from .nvchecker import NvResults
 from .tools import kill_child_processes
 from .lilacpy import load_lilac
 from .lilacyaml import load_lilacinfo
-from .const import _G, PACMAN_DB_DIR, mydir
+from .const import _G, PACMAN_DB_DIR, lilacdir
 from .repo import Repo
 
 logger = logging.getLogger(__name__)
@@ -133,7 +133,7 @@ def lilac_build(
             raise Exception('no package built')
         post_build = getattr(mod, 'post_build', None)
         if post_build is not None:
-            with file_lock(mydir / 'post_build.lock'):
+            with file_lock(lilacdir / 'post_build.lock'):
                 post_build()
         success = True
 

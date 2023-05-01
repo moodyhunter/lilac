@@ -129,10 +129,10 @@ if __name__ == '__main__':
 
   try:
     from lilac2.vendor.myutils import lock_file
-    from lilac2.const import mydir
+    from lilac2.const import lilacdir
   except ImportError:
     pass
   else:
-    lock_file(mydir / '.lock')
+    lock_file(lilacdir / '.lock')
 
   main(repodir, args.f)

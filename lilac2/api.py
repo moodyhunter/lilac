@@ -190,7 +190,7 @@ def run_protected(cmd: Cmd, **kwargs) -> str:
     basename = os.path.basename(pwd)
     extra_args = [
         '--share-net', '--bind', pwd, f'/tmp/{basename}', '--chdir', f'/tmp/{basename}',
-        '--ro-bind', const.mydir / 'gnupg', os.path.expanduser('~/.gnupg'),
+        '--ro-bind', const.lilacdir / 'gnupg', os.path.expanduser('~/.gnupg'),
     ]
     if _is_tmpfs('/var/lib/archbuild'):
         extra_args.extend(['--tmpfs', f'/tmp/{basename}/src'])
@@ -259,7 +259,7 @@ def update_pkgrel(
     with open('PKGBUILD') as f:
         pkgbuild = f.read()
 
-    def replacer(m):
+    def replacer(m: re.Match):
         nonlocal rel
         if rel is None:
             rel = _next_pkgrel(m.group(1))
@@ -457,9 +457,9 @@ def git_pkgbuild_commit() -> None:
 
 
 def _prepend_self_path() -> None:
-    mydir = Path(__file__).resolve().parent.parent
+    lilacdir = Path(__file__).resolve().parent.parent
     path = os.environ['PATH']
-    os.environ['PATH'] = str(mydir / path)
+    os.environ['PATH'] = str(lilacdir / path)
 
 
 def single_main(build_prefix: str = 'makepkg') -> None:

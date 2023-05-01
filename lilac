@@ -1,6 +1,25 @@
 #!/usr/bin/python3 -u
 
 from __future__ import annotations
+from lilac2 import slogconf
+from lilac2.building import build_package, MissingDependencies
+from lilac2 import pkgbuild
+from lilac2.nomypy import BuildResult, BuildReason  # type: ignore
+from lilac2.nvchecker import packages_need_update, nvtake, NvResults
+from lilac2.const import lilacdir, _G, PACMAN_DB_DIR
+from lilac2.repo import Repo
+from lilac2.tools import read_config
+from lilac2.cmd import (
+    run_cmd, git_pull_override, git_push, pkgrel_changed,
+    git_reset_hard, get_git_branch,
+)
+from lilac2.packages import (
+    DependencyManager, get_dependency_map, get_changed_packages,
+    Dependency,
+)
+from lilac2.vendor.nicelogger import enable_pretty_logging
+from lilac2.vendor.serializer import PickledData
+from lilac2.vendor.myutils import lock_file
 
 import os
 import sys
@@ -16,8 +35,8 @@ import json
 import datetime
 import threading
 from concurrent.futures import (
-  ThreadPoolExecutor, Future,
-  wait as futures_wait, FIRST_COMPLETED,
+    ThreadPoolExecutor, Future,
+    wait as futures_wait, FIRST_COMPLETED,
 )
 import subprocess
 from functools import partial
@@ -28,31 +47,6 @@ from structlog.types import Processor
 
 topdir = Path(__file__).resolve().parent
 
-from lilac2.vendor.myutils import lock_file
-from lilac2.vendor.serializer import PickledData
-from lilac2.vendor.nicelogger import enable_pretty_logging
-
-from lilac2.packages import (
-  DependencyManager, get_dependency_map, get_changed_packages,
-  Dependency,
-)
-from lilac2.cmd import (
-  run_cmd, git_pull_override, git_push, pkgrel_changed,
-  git_reset_hard, get_git_branch,
-)
-from lilac2.tools import read_config
-from lilac2.repo import Repo
-from lilac2.const import mydir, _G, PACMAN_DB_DIR
-from lilac2.nvchecker import packages_need_update, nvtake, NvResults
-from lilac2.nomypy import BuildResult, BuildReason # type: ignore
-from lilac2 import pkgbuild
-from lilac2.building import build_package, MissingDependencies
-from lilac2 import slogconf
-try:
-  from lilac2 import db
-except ImportError:
-  class db: # type: ignore
-    USE = False
 
 config = read_config()
 
@@ -74,628 +68,521 @@ REPO = _G.repo = Repo(config)
 
 EMPTY_COMMIT = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
+
 def setup_build_logger() -> None:
-  handler = logging.FileHandler(mydir / 'build.log')
-  handler.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
-  build_logger_old.addHandler(handler)
+    handler = logging.FileHandler(lilacdir / 'build.log')
+    handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    build_logger_old.addHandler(handler)
 
-  logfile = (mydir / 'build-log.json').open('a')
+    logfile = (lilacdir / 'build-log.json').open('a')
 
-  processors: List[Processor] = [
-    slogconf.exc_info,
-    slogconf.add_timestamp,
-    structlog.processors.format_exc_info,
-    slogconf.json_renderer,
-  ]
+    processors: List[Processor] = [
+        slogconf.exc_info,
+        slogconf.add_timestamp,
+        structlog.processors.format_exc_info,
+        slogconf.json_renderer,
+    ]
 
-  logger_factory = structlog.PrintLoggerFactory(file=logfile)
+    logger_factory = structlog.PrintLoggerFactory(file=logfile)
 
-  structlog.configure(
-    processors = processors,
-    logger_factory = logger_factory,
-  )
+    structlog.configure(
+        processors=processors,
+        logger_factory=logger_factory,
+    )
+
 
 def git_last_commit() -> str:
-  cmd = ['git', 'log', '-1', '--format=%H']
-  return run_cmd(cmd).strip()
+    cmd = ['git', 'log', '-1', '--format=%H']
+    return run_cmd(cmd).strip()
+
 
 def packages_with_depends(
-  repo: Repo,
+    repo: Repo,
 ) -> Tuple[graphlib.TopologicalSorter, dict[str, set[str]]]:
-  dep_building_map: dict[str, set[str]] = {}
-  nonexistent: DefaultDict[str, List[Dependency]] = defaultdict(list)
-  for name in tuple(build_reasons):
-    ds = DEPMAP[name]
-    for d in ds:
-      if not d.resolve():
-        if not repo.manages(d):
-          logger.warning('%s depends on %s, but it\'s not managed.',
-                         name, d)
-          nonexistent[name].append(d)
-          continue
+    dep_building_map: dict[str, set[str]] = {}
+    nonexistent: DefaultDict[str, List[Dependency]] = defaultdict(list)
+    for name in tuple(build_reasons):
+        ds = DEPMAP[name]
+        for d in ds:
+            if not d.resolve():
+                if not repo.manages(d):
+                    logger.warning('%s depends on %s, but it\'s not managed.',
+                                   name, d)
+                    nonexistent[name].append(d)
+                    continue
 
-        # don't rebuild a failed dep
-        if db.USE and db.is_last_build_failed(d.pkgname):
-          continue
+                logger.info('build %s as a dependency of %s because no built package found',
+                            d.pkgname, name)
+                build_reasons[d.pkgname].append(BuildReason.Depended(name))
 
-        logger.info('build %s as a dependency of %s because no built package found',
-                    d.pkgname, name)
-        build_reasons[d.pkgname].append(BuildReason.Depended(name))
+        dep_building_map[name] = set()
+        for x in ds:
+            pkgbase = x.pkgdir.name
+            dep_building_map[name].add(pkgbase)
+            # a dependency may depend other packages, we need their relations
+            if pkgbase in DEPMAP:
+                dep_building_map[pkgbase] = {
+                    x.pkgdir.name for x in DEPMAP[pkgbase]}
 
-    dep_building_map[name] = set()
-    for x in ds:
-      pkgbase = x.pkgdir.name
-      dep_building_map[name].add(pkgbase)
-      # a dependency may depend other packages, we need their relations
-      if pkgbase in DEPMAP:
-        dep_building_map[pkgbase] = {
-          x.pkgdir.name for x in DEPMAP[pkgbase]}
-
-  for name, deps in nonexistent.items():
-    repo.send_error_report(
-      repo.lilacinfos[name],
-      subject='软件包 %s 的 lilac.yaml 指定了不存在的依赖',
-      msg = f'软件包 {name} 的 lilac.yaml 指定了 repo_depends，然而其直接或者间接的依赖项 {deps!r} 并不在本仓库中。'
-    )
-
-  sorter = graphlib.TopologicalSorter(dep_building_map)
-
-  packages = graphlib.TopologicalSorter(dep_building_map).static_order()
-  # filter out already built packages
-  packages = [x for x in packages if x in build_reasons]
-  for p in packages:
-    logger.info('building %s because of %r', p, build_reasons[p])
-
-  if db.USE:
-    from sqlalchemy import delete
-    with db.get_session() as s:
-      stmt = delete(db.PkgCurrent)
-      s.execute(stmt)
-
-      for idx, pkg in enumerate(packages):
-        rs = [r.to_dict() for r in build_reasons[pkg]]
-        p = db.PkgCurrent(
-          pkgbase = pkg,
-          index = idx,
-          status = 'pending',
-          build_reasons = json.dumps(rs),
+    for name, deps in nonexistent.items():
+        repo.send_error_report(
+            repo.lilacinfos[name],
+            subject='软件包 %s 的 lilac.yaml 指定了不存在的依赖',
+            msg=f'软件包 {name} 的 lilac.yaml 指定了 repo_depends，然而其直接或者间接的依赖项 {deps!r} 并不在本仓库中。'
         )
-        s.add(p)
-      db.build_updated(s)
 
-  return sorter, dep_building_map
+    sorter = graphlib.TopologicalSorter(dep_building_map)
+
+    packages = graphlib.TopologicalSorter(dep_building_map).static_order()
+    # filter out already built packages
+    packages = [x for x in packages if x in build_reasons]
+    for p in packages:
+        logger.info('building %s because of %r', p, build_reasons[p])
+
+    return sorter, dep_building_map
+
 
 def building_priority(revdepmap: dict[str, set[str]], pkg: str) -> int:
-  new = {pkg}
-  while new:
-    depees: set[str] = set()
-    new_new = set()
-    for p in new:
-      if d := revdepmap.get(p):
-        new_new.update(d - depees)
-        depees.update(d)
-    new = new_new
-  rs = build_reasons[pkg]
-  for p in depees:
-    rs.extend(build_reasons[p])
-  return min(buildreason_priority(r, revdepmap) for r in rs)
+    new = {pkg}
+    while new:
+        depees: set[str] = set()
+        new_new = set()
+        for p in new:
+            if d := revdepmap.get(p):
+                new_new.update(d - depees)
+                depees.update(d)
+        new = new_new
+    rs = build_reasons[pkg]
+    for p in depees:
+        rs.extend(build_reasons[p])
+    return min(buildreason_priority(r, revdepmap) for r in rs)
+
 
 def buildreason_priority(r: BuildReason, revdepmap: dict[str, set[str]]) -> int:
-  if isinstance(r, BuildReason.UpdatedPkgrel):
-    return 0
+    if isinstance(r, BuildReason.UpdatedPkgrel):
+        return 0
 
-  if isinstance(r, BuildReason.NvChecker):
-    if any(source == 'manual' for _, source in r.items):
-      return 0
-    if len(r.items) > 1 or r.items[0][0] > 0:
-      # rebuild seen by nvchecker
-      return 1
+    if isinstance(r, BuildReason.NvChecker):
+        if any(source == 'manual' for _, source in r.items):
+            return 0
+        if len(r.items) > 1 or r.items[0][0] > 0:
+            # rebuild seen by nvchecker
+            return 1
 
-  if isinstance(r, BuildReason.Depended):
-    return building_priority(revdepmap, r.depender)
+    if isinstance(r, BuildReason.Depended):
+        return building_priority(revdepmap, r.depender)
 
-  if isinstance(r, BuildReason.UpdatedFailed):
-    return 2
+    if isinstance(r, BuildReason.UpdatedFailed):
+        return 2
 
-  return 3
+    return 3
+
 
 class BuildSorter:
-  def __init__(
-    self,
-    sorter: graphlib.TopologicalSorter,
-    depmap: dict[str, set[str]],
-  ) -> None:
-    sorter.prepare()
-    self.sorter = sorter
-    self.ready: list[str] = []
+    def __init__(
+        self,
+        sorter: graphlib.TopologicalSorter,
+        depmap: dict[str, set[str]],
+    ) -> None:
+        sorter.prepare()
+        self.sorter = sorter
+        self.ready: list[str] = []
 
-    revdepmap = defaultdict(set)
-    for p, deps in depmap.items():
-      for a in deps:
-        revdepmap[a].add(p)
+        revdepmap = defaultdict(set)
+        for p, deps in depmap.items():
+            for a in deps:
+                revdepmap[a].add(p)
 
-    self.priority_func = partial(building_priority, revdepmap)
+        self.priority_func = partial(building_priority, revdepmap)
 
-  def is_active(self) -> bool:
-    return self.sorter.is_active()
+    def is_active(self) -> bool:
+        return self.sorter.is_active()
 
-  def done(self, pkg: str) -> None:
-    self.ready.remove(pkg)
-    self.sorter.done(pkg)
+    def done(self, pkg: str) -> None:
+        self.ready.remove(pkg)
+        self.sorter.done(pkg)
 
-  def get_ready(self) -> tuple[str, ...]:
-    new = self.sorter.get_ready()
-    while new:
-      self.ready += [x for x in new if x in build_reasons]
-      self.ready.sort(key = self.priority_func)
-      self.sorter.done(*[x for x in new if x not in build_reasons])
-      new = self.sorter.get_ready()
-    logger.debug('ready-to-build packages: %s', self.ready)
-    return tuple(self.ready)
+    def get_ready(self) -> tuple[str, ...]:
+        new = self.sorter.get_ready()
+        while new:
+            self.ready += [x for x in new if x in build_reasons]
+            self.ready.sort(key=self.priority_func)
+            self.sorter.done(*[x for x in new if x not in build_reasons])
+            new = self.sorter.get_ready()
+        logger.debug('ready-to-build packages: %s', self.ready)
+        return tuple(self.ready)
+
 
 def start_build(
-  repo: Repo,
-  logdir: Path,
-  failed: dict[str, tuple[str, ...]],
-  built: set[str],
-  max_concurrency: int,
+    repo: Repo,
+    logdir: Path,
+    failed: dict[str, tuple[str, ...]],
+    built: set[str],
+    max_concurrency: int,
 ) -> None:
-  # built is used to collect built package names
-  sorter, depmap = packages_with_depends(repo)
+    # built is used to collect built package names
+    sorter, depmap = packages_with_depends(repo)
 
-  try:
-    buildsorter = BuildSorter(sorter, depmap)
-    futures: dict[Future, str] = {}
-    with ThreadPoolExecutor(
-      max_workers = max_concurrency,
-      initializer = setup_thread,
-    ) as executor:
-      while True:
-        pkgs = try_pick_some(
-          repo,
-          buildsorter, failed,
-          running = frozenset(futures.values()),
-          limit = max_concurrency - len(futures),
-        )
-        for pkg in pkgs:
-          fu = executor.submit(
-            build_it, pkg, repo, buildsorter, built, failed)
-          futures[fu] = pkg
+    try:
+        buildsorter = BuildSorter(sorter, depmap)
+        futures: dict[Future, str] = {}
+        with ThreadPoolExecutor(
+            max_workers=max_concurrency,
+            initializer=setup_thread,
+        ) as executor:
+            while True:
+                pkgs = try_pick_some(
+                    repo,
+                    buildsorter, failed,
+                    running=frozenset(futures.values()),
+                    limit=max_concurrency - len(futures),
+                )
+                for pkg in pkgs:
+                    fu = executor.submit(
+                        build_it, pkg, repo, buildsorter, built, failed)
+                    futures[fu] = pkg
 
-        if not futures:
-          # no task is running: we're done
-          break
+                if not futures:
+                    # no task is running: we're done
+                    break
 
-        done, pending = futures_wait(futures, return_when=FIRST_COMPLETED)
-        for fu in done:
-          del futures[fu]
-          fu.result()
+                done, pending = futures_wait(
+                    futures, return_when=FIRST_COMPLETED)
+                for fu in done:
+                    del futures[fu]
+                    fu.result()
 
-        # at least one task is done, try pick new tasks
+                # at least one task is done, try pick new tasks
 
-  except KeyboardInterrupt:
-    logger.info('keyboard interrupted, bye~')
+    except KeyboardInterrupt:
+        logger.info('keyboard interrupted, bye~')
+
 
 def try_pick_some(
-  repo: Repo,
-  buildsorter: BuildSorter,
-  failed: dict[str, tuple[str, ...]],
-  running: Set[str],
-  limit: int,
+    repo: Repo,
+    buildsorter: BuildSorter,
+    failed: dict[str, tuple[str, ...]],
+    running: Set[str],
+    limit: int,
 ) -> list[str]:
-  ret: list[str] = []
+    ret: list[str] = []
 
-  if not buildsorter.is_active():
-    return ret
+    if not buildsorter.is_active():
+        return ret
 
-  ready = buildsorter.get_ready()
-  if not ready:
-    return ret
+    ready = buildsorter.get_ready()
+    if not ready:
+        return ret
 
-  for pkg in ready:
-    if pkg in running:
-      continue
-
-    if pkg in failed:
-      buildsorter.done(pkg)
-      if db.USE:
-        with db.get_session() as s:
-          db.mark_pkg_as(s, pkg, 'done')
-          db.build_updated(s)
-      # marked as failed (by lilac loader), skip
-      continue
-
-    if rs := build_reasons.get(pkg):
-      if len(rs) == 1 and isinstance(rs[0], BuildReason.FailedByDeps):
-        ds = DEPMAP[pkg]
-        if not all(d.resolve() for d in ds):
-          buildsorter.done(pkg)
-          if db.USE:
-            with db.get_session() as s:
-              db.mark_pkg_as(s, pkg, 'done')
-              db.build_updated(s)
-          # deps are still missing, skip
-          continue
-      if len(rs) == 1 and isinstance(rs[0], BuildReason.OnBuild):
-        update_on_build = rs[0].update_on_build
-        if any(x.pkgbase in failed for x in update_on_build):
-          buildsorter.done(pkg)
-          if db.USE:
-            with db.get_session() as s:
-              db.mark_pkg_as(s, pkg, 'done')
-              db.build_updated(s)
-          # deps have failures, skip
-          continue
-        try:
-          if db.USE and not db.check_update_on_build(update_on_build):
-            buildsorter.done(pkg)
-            with db.get_session() as s:
-              db.mark_pkg_as(s, pkg, 'done')
-              db.build_updated(s)
-            # no need to rebuild
+    for pkg in ready:
+        if pkg in running:
             continue
-        except Exception as e:
-          logger.exception('check_update_on_build')
-          mod = repo.lilacinfos[pkg]
-          repo.send_error_report(
-            mod, subject='%s update_on_build 检查出错', exc=e,
-          )
-          continue
 
-    ret.append(pkg)
-    if len(ret) == limit:
-      break
+        if pkg in failed:
+            buildsorter.done(pkg)
+            # marked as failed (by lilac loader), skip
+            continue
 
-  return ret
+        if rs := build_reasons.get(pkg):
+            if len(rs) == 1 and isinstance(rs[0], BuildReason.FailedByDeps):
+                ds = DEPMAP[pkg]
+                if not all(d.resolve() for d in ds):
+                    buildsorter.done(pkg)
+                    # deps are still missing, skip
+                    continue
+            if len(rs) == 1 and isinstance(rs[0], BuildReason.OnBuild):
+                update_on_build = rs[0].update_on_build
+                if any(x.pkgbase in failed for x in update_on_build):
+                    buildsorter.done(pkg)
+                    # deps have failures, skip
+                    continue
+        ret.append(pkg)
+        if len(ret) == limit:
+            break
+
+    return ret
+
 
 def build_it(
-  pkg: str, repo: Repo, buildsorter: BuildSorter,
-  built: set[str], failed: dict[str, tuple[str, ...]],
+    pkg: str, repo: Repo, buildsorter: BuildSorter,
+    built: set[str], failed: dict[str, tuple[str, ...]],
 ) -> None:
-  logger.info('building %s', pkg)
-  logfile = logdir / f'{pkg}.log'
+    logger.info('building %s', pkg)
+    logfile = logdir / f'{pkg}.log'
 
-  if db.USE:
-    with db.get_session() as s:
-      db.mark_pkg_as(s, pkg, 'building')
-      db.build_updated(s)
-
-  r, version = build_package(
-    pkg, repo.lilacinfos[pkg],
-    update_info = nvdata[pkg],
-    bindmounts = repo.bindmounts,
-    tmpfs = repo.tmpfs,
-    depends = DEPMAP.get(pkg, ()),
-    repo = REPO,
-    myname = MYNAME,
-    destdir = DESTDIR,
-    logfile = logfile,
-  )
-
-  elapsed = r.elapsed
-  logger.info(
-    'package %s (version %s) finished in %ds with result: %r',
-    pkg, version, elapsed, r,
-  )
-  repo.on_built(pkg, r, version)
-
-  newver = nvdata[pkg].newver
-  msg = None
-
-  if isinstance(r, BuildResult.successful):
-    build_logger_old.info(
-      '%s %s [%s] successful after %ds',
-      pkg, newver, version, elapsed)
-    build_logger.info(
-      'successful', pkgbase = pkg,
-      nv_version = newver, pkg_version = version, elapsed = elapsed,
+    r, version = build_package(
+        pkg, repo.lilacinfos[pkg],
+        update_info=nvdata[pkg],
+        bindmounts=repo.bindmounts,
+        tmpfs=repo.tmpfs,
+        depends=DEPMAP.get(pkg, ()),
+        repo=REPO,
+        myname=MYNAME,
+        destdir=DESTDIR,
+        logfile=logfile,
     )
 
-  elif isinstance(r, BuildResult.staged):
-    build_logger_old.info(
-      '%s %s [%s] staged after %ds',
-      pkg, newver, version, elapsed)
-    build_logger.info(
-      'staged', pkgbase = pkg,
-      nv_version = newver, pkg_version = version, elapsed = elapsed,
+    elapsed = r.elapsed
+    logger.info(
+        'package %s (version %s) finished in %ds with result: %r',
+        pkg, version, elapsed, r,
     )
+    repo.on_built(pkg, r, version)
 
-  elif isinstance(r, BuildResult.skipped):
-    build_logger_old.warning('%s %s skipped after %ds', pkg, newver, elapsed)
-    build_logger.warning(
-      'skipped', pkgbase = pkg,
-      nv_version = newver, msg = r.reason, elapsed = elapsed,
-    )
-    msg = r.reason
+    newver = nvdata[pkg].newver
+    msg = None
 
-  elif isinstance(r, BuildResult.failed):
-    build_logger_old.error('%s %s [%s] failed after %ds', pkg, newver, version, elapsed)
-    assert r.error is not None
+    if isinstance(r, BuildResult.successful):
+        build_logger_old.info(
+            '%s %s [%s] successful after %ds',
+            pkg, newver, version, elapsed)
+        build_logger.info(
+            'successful', pkgbase=pkg,
+            nv_version=newver, pkg_version=version, elapsed=elapsed,
+        )
 
-    if isinstance(r.error, Exception):
-      e = r.error
-      build_logger.error(
-        'failed', pkgbase = pkg,
-        nv_version = newver, elapsed = elapsed, exc_info = e,
-      )
-      msg = repr(e)
-      mod = repo.lilacinfos[pkg]
+    elif isinstance(r, BuildResult.staged):
+        build_logger_old.info(
+            '%s %s [%s] staged after %ds',
+            pkg, newver, version, elapsed)
+        build_logger.info(
+            'staged', pkgbase=pkg,
+            nv_version=newver, pkg_version=version, elapsed=elapsed,
+        )
 
-      if isinstance(e, MissingDependencies):
-        faileddeps = e.deps.intersection(failed)
-        # e.deps - faileddeps = failed previously
-        failed[pkg] = tuple(e.deps)
-        if e.deps == faileddeps:
-          msg = f'{pkg} 的依赖 {faileddeps} 打包失败了。'
+    elif isinstance(r, BuildResult.skipped):
+        build_logger_old.warning(
+            '%s %s skipped after %ds', pkg, newver, elapsed)
+        build_logger.warning(
+            'skipped', pkgbase=pkg,
+            nv_version=newver, msg=r.reason, elapsed=elapsed,
+        )
+        msg = r.reason
+
+    elif isinstance(r, BuildResult.failed):
+        build_logger_old.error(
+            '%s %s [%s] failed after %ds', pkg, newver, version, elapsed)
+        assert r.error is not None
+
+        if isinstance(r.error, Exception):
+            e = r.error
+            build_logger.error(
+                'failed', pkgbase=pkg,
+                nv_version=newver, elapsed=elapsed, exc_info=e,
+            )
+            msg = repr(e)
+            mod = repo.lilacinfos[pkg]
+
+            if isinstance(e, MissingDependencies):
+                faileddeps = e.deps.intersection(failed)
+                # e.deps - faileddeps = failed previously
+                failed[pkg] = tuple(e.deps)
+                if e.deps == faileddeps:
+                    msg = f'{pkg} 的依赖 {faileddeps} 打包失败了。'
+                else:
+                    msg = f'{pkg} 缺少依赖 {e.deps}，其中 {faileddeps} 本次打包失败了。'
+                repo.send_error_report(mod, subject='%s 出现依赖问题', msg=msg)
+            else:
+                repo.send_error_report(mod, exc=e, logfile=logfile)
+
         else:
-          msg = f'{pkg} 缺少依赖 {e.deps}，其中 {faileddeps} 本次打包失败了。'
-        repo.send_error_report(mod, subject='%s 出现依赖问题', msg = msg)
-      else:
-        repo.send_error_report(mod, exc=e, logfile=logfile)
+            build_logger.error(
+                'failed', pkgbase=pkg,
+                nv_version=newver, pkg_version=version,
+                elapsed=elapsed, error=r.error,
+            )
+            msg = r.error
 
-    else:
-      build_logger.error(
-        'failed', pkgbase = pkg,
-        nv_version = newver, pkg_version = version,
-        elapsed = elapsed, error = r.error,
-      )
-      msg = r.error
+    buildsorter.done(pkg)
 
-  if db.USE:
-    if r.rusage:
-      cputime = r.rusage.cputime
-      memory = r.rusage.memory
-    else:
-      cputime = memory = None
-    rs = [r.to_dict() for r in build_reasons[pkg]]
-    with db.get_session() as s:
-      p = db.PkgLog(
-        pkgbase = pkg,
-        nv_version = newver,
-        pkg_version = version,
-        elapsed = elapsed,
-        result = r.__class__.__name__,
-        cputime = cputime,
-        memory = memory,
-        msg = msg,
-        build_reasons = json.dumps(rs),
-      )
-      s.add(p)
-      db.mark_pkg_as(s, pkg, 'done')
-      db.build_updated(s)
+    if r:
+        built.add(pkg)
+    elif pkg not in failed:
+        failed[pkg] = ()
 
-  buildsorter.done(pkg)
-
-  if r:
-    built.add(pkg)
-  elif pkg not in failed:
-    failed[pkg] = ()
 
 WORKER_NO = 0
 WORKER_NO_LOCK = threading.Lock()
 
+
 def setup_thread():
-  global WORKER_NO
-  from lilac2.building import TLS
-  with WORKER_NO_LOCK:
-    TLS.worker_no = WORKER_NO
-    WORKER_NO += 1
+    global WORKER_NO
+    from lilac2.building import TLS
+    with WORKER_NO_LOCK:
+        TLS.worker_no = WORKER_NO
+        WORKER_NO += 1
+
 
 def main_may_raise(
-  D: dict[str, Any], pkgs_from_args: List[str], logdir: Path,
+    store: dict[str, Any], pkgs_from_args: List[str], logdir: Path,
 ) -> None:
-  global DEPMAP
+    global DEPMAP
 
-  if get_git_branch() not in ['master', 'main']:
-    raise Exception('repo not on master or main, aborting.')
+    if get_git_branch() not in ['master', 'main']:
+        raise Exception('repo not on master or main, aborting.')
 
-  if dburl := config['lilac'].get('dburl'):
-    import sqlalchemy
-    engine = sqlalchemy.create_engine(dburl)
-    db.setup(engine)
-
-  if cmds := config.get('misc', {}).get('prerun'):
-    for cmd in cmds:
-      subprocess.check_call(cmd)
-
-  git_reset_hard()
-  git_pull_override()
-  failed = REPO.load_managed_lilac_and_report()
-
-  depman = DependencyManager(REPO.repodir)
-  DEPMAP = get_dependency_map(depman, REPO.lilacinfos)
-
-  # packages we care about
-  care_pkgs: set[str] = set()
-  for pkg_to_build in pkgs_from_args:
-    care_pkgs.update(dep.pkgname for dep in DEPMAP[pkg_to_build])
-    care_pkgs.add(pkg_to_build)
-
-  proxy = config['nvchecker'].get('proxy')
-  _nvdata, unknown, rebuild = packages_need_update(
-    REPO, proxy, care_pkgs,
-  )
-  nvdata.update(_nvdata) # update to the global object
-
-  failed_info = D.get('failed', {})
-
-  if not pkgs_from_args:
-    U = set(REPO.lilacinfos)
-    last_commit = D.get('last_commit', EMPTY_COMMIT)
-    changed = get_changed_packages(last_commit, 'HEAD') & U
-
-    failed_prev = set(failed_info.keys())
-    # no update from upstream, but build instructions have changed; rebuild
-    # failed ones
-    need_rebuild_failed = failed_prev & changed
-    # if pkgrel is updated, build a new release
-    need_rebuild_pkgrel = {x for x in changed
-                          if pkgrel_changed(last_commit, 'HEAD', x)} - unknown
-
-  nv_changed = {}
-  for p, vers in nvdata.items():
-    diff_idxs = [i for i, v in enumerate(vers)
-                 if v.oldver != v.newver]
-    if diff_idxs:
-      info = REPO.lilacinfos[p]
-      confs = info.update_on
-      sources = [(i, confs[i]['source']) for i in diff_idxs]
-      nv_changed[p] = sources
-
-  if db.USE:
-    now = datetime.datetime.now().astimezone()
-    pkgs_may_throttle = [p for p in nv_changed if REPO.lilacinfos[p].throttle_info]
-    last_times = dict(db.get_pkgs_last_success_times(pkgs_may_throttle))
-    for p, sources in nv_changed.items():
-      ss = []
-      for idx, source in sources:
-        if interval := REPO.lilacinfos[p].throttle_info.get(idx):
-          if last := last_times.get(p):
-            if last + interval > now:
-              continue
-        ss.append((idx, source))
-      if ss:
-        build_reasons[p].append(BuildReason.NvChecker(ss))
-  else:
-    for p, sources in nv_changed.items():
-      build_reasons[p].append(BuildReason.NvChecker(sources))
-
-  if pkgs_from_args:
-    for p in pkgs_from_args:
-      build_reasons[p].append(BuildReason.Cmdline())
-  else:
-    for p in need_rebuild_pkgrel:
-      build_reasons[p].append(BuildReason.UpdatedPkgrel())
-
-    for p in need_rebuild_failed:
-      build_reasons[p].append(BuildReason.UpdatedFailed())
-
-    for p, i in failed_info.items():
-      # p might have been removed
-      if p in REPO.lilacinfos and (deps := i['missing']):
-        build_reasons[p].append(BuildReason.FailedByDeps(deps))
-
-  if_this_then_those = defaultdict(set)
-  for p, info in REPO.lilacinfos.items():
-    for i in info.update_on_build:
-      if_this_then_those[i.pkgbase].add(p)
-  more_pkgs = set()
-  count = 0
-  for p in build_reasons:
-    if pkgs := if_this_then_those.get(p):
-      more_pkgs.update(pkgs)
-  while len(more_pkgs) != count: # has new
-    count = len(more_pkgs)
-    for p in more_pkgs:
-      if pkgs := if_this_then_those.get(p):
-        more_pkgs.update(pkgs)
-  for p in more_pkgs:
-    update_on_build = REPO.lilacinfos[p].update_on_build
-    build_reasons[p].append(BuildReason.OnBuild(update_on_build))
-
-  update_succeeded: set[str] = set()
-
-  try:
-    build_logger.info('build start')
-    if db.USE:
-      logdir_name = logdir.name
-      with db.get_session() as s:
-        b = db.Batch(event='start', logdir=logdir_name)
-        s.add(b)
-        db.build_updated(s)
-    start_build(REPO, logdir, failed, update_succeeded,
-                config['lilac'].get('max_concurrency', 1))
-  finally:
-    D['last_commit'] = git_last_commit()
-    # handle what has been processed even on exception
-    for k, v in failed.items():
-      if nv := nvdata.get(k):
-        failed_info[k] = {
-          'version': nv.newver, # not used
-          'missing': v,
-        }
-
-    for x in update_succeeded:
-      if x in failed_info:
-        del failed_info[x]
-    # cleanup removed package failed_info
-    if not pkgs_from_args:
-      for x in tuple(failed_info.keys()):
-        if x not in REPO.lilacinfos:
-          del failed_info[x]
-    D['failed'] = failed_info
-
-    if config['lilac']['rebuild_failed_pkgs']:
-      if update_succeeded:
-        nvtake(update_succeeded, REPO.lilacinfos)
-    else:
-      updated_by_nv = {
-        p for p, rs in build_reasons.items()
-        if any(isinstance(r, BuildReason.NvChecker) for r in rs)
-      }
-      if updated_by_nv:
-        # only nvtake packages we have tried to build (excluding unbuilt
-        # packages due to internal errors)
-        built = update_succeeded.union(failed)
-        update_nv = built & updated_by_nv
-        nvtake(update_nv, REPO.lilacinfos)
-
-    build_logger.info('build end')
-    if db.USE:
-      with db.get_session() as s:
-        b = db.Batch(event='stop')
-        s.add(b)
-        db.build_updated(s)
+    if cmds := config.get('misc', {}).get('prerun'):
+        for cmd in cmds:
+            subprocess.check_call(cmd)
 
     git_reset_hard()
-    if config['lilac']['git_push']:
-      git_push()
+    git_pull_override()
+    failed = REPO.load_managed_lilac_and_report()
 
-    if cmds := config.get('misc', {}).get('postrun'):
-      for cmd in cmds:
-        subprocess.check_call(cmd)
+    depman = DependencyManager(REPO.repodir)
+    DEPMAP = get_dependency_map(depman, REPO.lilacinfos)
 
-def main(logdir: Path, pkgs_from_args: List[str]) -> None:
-  store = mydir / 'store'
-  with PickledData(store, default={}) as D:
+    # packages we care about
+    care_pkgs: set[str] = set()
+    for pkg_to_build in pkgs_from_args:
+        logger.info('adding %s to care_pkgs', pkg_to_build)
+        care_pkgs.update(dep.pkgname for dep in DEPMAP[pkg_to_build])
+        care_pkgs.add(pkg_to_build)
+
+    logger.info('care_pkgs: %s', care_pkgs)
+    proxy = config['nvchecker'].get('proxy')
+    _nvdata, unknown, rebuild = packages_need_update(REPO, proxy, care_pkgs)
+    nvdata.update(_nvdata)  # update to the global object
+
+    failed_info = store.get('failed', {})
+
+    if not pkgs_from_args:
+        U = set(REPO.lilacinfos)
+        last_commit = store.get('last_commit', EMPTY_COMMIT)
+        changed = get_changed_packages(last_commit, 'HEAD') & U
+
+        failed_prev = set(failed_info.keys())
+        # no update from upstream, but build instructions have changed; rebuild
+        # failed ones
+        need_rebuild_failed = failed_prev & changed
+        # if pkgrel is updated, build a new release
+        need_rebuild_pkgrel = {x for x in changed
+                               if pkgrel_changed(last_commit, 'HEAD', x)} - unknown
+
+    nv_changed = {}
+    for p, vers in nvdata.items():
+        diff_idxs = [i for i, v in enumerate(vers)
+                     if v.oldver != v.newver]
+        if diff_idxs:
+            info = REPO.lilacinfos[p]
+            confs = info.update_on
+            sources = [(i, confs[i]['source']) for i in diff_idxs]
+            nv_changed[p] = sources
+
+    for p, sources in nv_changed.items():
+        build_reasons[p].append(BuildReason.NvChecker(sources))
+
+    if pkgs_from_args:
+        for p in pkgs_from_args:
+            build_reasons[p].append(BuildReason.Cmdline())
+    else:
+        for p in need_rebuild_pkgrel:
+            build_reasons[p].append(BuildReason.UpdatedPkgrel())
+
+        for p in need_rebuild_failed:
+            build_reasons[p].append(BuildReason.UpdatedFailed())
+
+        for p, i in failed_info.items():
+            # p might have been removed
+            if p in REPO.lilacinfos and (deps := i['missing']):
+                build_reasons[p].append(BuildReason.FailedByDeps(deps))
+
+    if_this_then_those = defaultdict(set)
+    for p, info in REPO.lilacinfos.items():
+        for i in info.update_on_build:
+            if_this_then_those[i.pkgbase].add(p)
+    more_pkgs = set()
+    count = 0
+    for p in build_reasons:
+        if pkgs := if_this_then_those.get(p):
+            more_pkgs.update(pkgs)
+    while len(more_pkgs) != count:  # has new
+        count = len(more_pkgs)
+        for p in more_pkgs:
+            if pkgs := if_this_then_those.get(p):
+                more_pkgs.update(pkgs)
+    for p in more_pkgs:
+        update_on_build = REPO.lilacinfos[p].update_on_build
+        build_reasons[p].append(BuildReason.OnBuild(update_on_build))
+
+    update_succeeded: set[str] = set()
+
     try:
-      main_may_raise(D, pkgs_from_args, logdir)
-    except Exception:
-      tb = traceback.format_exc()
-      logger.exception('unexpected error')
-      subject = '运行时错误'
-      msg = '调用栈如下：\n\n' + tb
-      REPO.report_error(subject, msg)
+        build_logger.info('build start')
+        start_build(REPO, logdir, failed, update_succeeded,
+                    config['lilac'].get('max_concurrency', 1))
+    finally:
+        store['last_commit'] = git_last_commit()
+        # handle what has been processed even on exception
+        for k, v in failed.items():
+            if nv := nvdata.get(k):
+                failed_info[k] = {
+                    'version': nv.newver,  # not used
+                    'missing': v,
+                }
 
-def setup() -> Path:
-  prctl.set_child_subreaper(1)
+        for x in update_succeeded:
+            if x in failed_info:
+                del failed_info[x]
+        # cleanup removed package failed_info
+        if not pkgs_from_args:
+            for x in tuple(failed_info.keys()):
+                if x not in REPO.lilacinfos:
+                    del failed_info[x]
+        store['failed'] = failed_info
 
-  logdir = mydir / 'log' / time.strftime('%Y-%m-%dT%H:%M:%S')
-  logdir.mkdir(parents=True, exist_ok=True)
-  logfile = logdir / 'lilac-main.log'
-  fd = os.open(logfile, os.O_WRONLY | os.O_CREAT, 0o644)
-  os.dup2(fd, 1)
-  os.dup2(fd, 2)
-  os.close(fd)
+        if config['lilac']['rebuild_failed_pkgs']:
+            if update_succeeded:
+                nvtake(update_succeeded, REPO.lilacinfos)
+        else:
+            updated_by_nv = {
+                p for p, rs in build_reasons.items()
+                if any(isinstance(r, BuildReason.NvChecker) for r in rs)
+            }
+            if updated_by_nv:
+                # only nvtake packages we have tried to build (excluding unbuilt
+                # packages due to internal errors)
+                built = update_succeeded.union(failed)
+                update_nv = built & updated_by_nv
+                nvtake(update_nv, REPO.lilacinfos)
 
-  enable_pretty_logging('DEBUG')
-  if 'MAKEFLAGS' not in os.environ:
-    cores = os.cpu_count()
-    if cores is not None:
-      os.environ['MAKEFLAGS'] = '-j{0}'.format(cores)
+        build_logger.info('build end')
+        git_reset_hard()
+        if config['lilac']['git_push']:
+            git_push()
 
-  lock_file(mydir / '.lock')
-
-  setup_build_logger()
-  os.chdir(REPO.repodir)
-
-  pkgbuild.update_data(PACMAN_DB_DIR)
-
-  return logdir
+        if cmds := config.get('misc', {}).get('postrun'):
+            for cmd in cmds:
+                subprocess.check_call(cmd)
 
 if __name__ == '__main__':
-  try:
-    logdir = setup()
-    main(logdir, sys.argv[1:])
-  except Exception:
-    logger.exception('unexpected error')
+    try:
+        prctl.set_child_subreaper(1)
+        logdir = lilacdir / 'log' / time.strftime('%Y-%m-%d_%H%M%S')
+        logdir.mkdir(parents=True, exist_ok=True)
+        enable_pretty_logging(logging.DEBUG)
+        setup_build_logger()
+
+        if 'MAKEFLAGS' not in os.environ:
+            cores = os.cpu_count()
+            if cores is not None:
+                os.environ['MAKEFLAGS'] = '-j{0}'.format(cores)
+
+        lock_file(lilacdir / '.lock')
+        os.chdir(REPO.repodir)
+        pkgbuild.update_data(PACMAN_DB_DIR)
+
+        store = lilacdir / 'store'
+        with PickledData(store, default={}) as store_data:
+            try:
+                main_may_raise(store_data, sys.argv[1:], logdir)
+            except Exception:
+                tb = traceback.format_exc()
+                logger.exception('unexpected error')
+                subject = '运行时错误'
+                msg = '调用栈如下：\n\n' + tb
+                REPO.report_error(subject, msg)
+
+    except Exception:
+        logger.exception('unexpected error')

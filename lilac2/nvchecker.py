@@ -15,7 +15,7 @@ from typing import (
 import tomli_w
 
 from .cmd import run_cmd
-from .const import mydir
+from .const import lilacdir
 from .typing import LilacInfos, PathLike
 from .tools import reap_zombies
 
@@ -25,10 +25,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-NVCHECKER_FILE: Path = mydir / 'nvchecker.toml'
-KEY_FILE: Path = mydir / 'nvchecker_keyfile.toml'
-OLDVER_FILE = mydir / 'oldver'
-NEWVER_FILE = mydir / 'newver'
+NVCHECKER_FILE: Path = lilacdir / 'nvchecker.toml'
+KEY_FILE: Path = lilacdir / 'nvchecker_keyfile.toml'
+OLDVER_FILE = lilacdir / 'oldver'
+NEWVER_FILE = lilacdir / 'newver'
 
 
 class NvResult(NamedTuple):
