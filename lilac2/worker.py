@@ -212,7 +212,7 @@ def run_build_cmd(cmd: Cmd) -> None:
 
 
 def main() -> None:
-    enable_pretty_logging('DEBUG')
+    enable_pretty_logging(level=logging.DEBUG)
 
     from .tools import read_config
     config = read_config()

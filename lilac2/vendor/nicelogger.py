@@ -17,7 +17,7 @@ class TornadoLogFormatter(logging.Formatter):
         self._color = color
         if color:
             import curses
-            curses.setupterm()
+            curses.setupterm("xterm-256color")
             if sys.hexversion < 0x30203f0:
                 fg_color = str(curses.tigetstr("setaf") or
                                curses.tigetstr("setf") or "", "ascii")
