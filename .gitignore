@@ -1,3 +1,5 @@
+.venv/
+
 pylib/
 __pycache__/
 *.sw*

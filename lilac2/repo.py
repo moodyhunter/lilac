@@ -4,7 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 from typing import (
-  Optional, Tuple, List, Union, Dict, TYPE_CHECKING, Any,
+    Optional, Tuple, List, Union, Dict, TYPE_CHECKING, Any,
 )
 import logging
 from functools import lru_cache
@@ -21,350 +21,357 @@ from .mail import MailService
 from .tools import ansi_escape_re
 from . import api, lilacyaml
 from .typing import LilacMod, Maintainer, LilacInfos, LilacInfo
-from .nomypy import BuildResult # type: ignore
+from .nomypy import BuildResult  # type: ignore
 if TYPE_CHECKING:
-  from .packages import Dependency
-  del Dependency
+    from .packages import Dependency
+    del Dependency
 
 logger = logging.getLogger(__name__)
 build_logger_old = logging.getLogger('build')
 build_logger = structlog.get_logger(logger_name='build')
 
+
 class Repo:
-  gh: Optional[GitHub]
+    gh: Optional[GitHub]
 
-  def __init__(self, config: dict[str, Any]) -> None:
-    self.myaddress = config['lilac']['email']
-    self.mymaster = config['lilac']['master']
-    self.logurl_template = config['lilac'].get('logurl')
-    self.repomail = config['repository']['email']
-    self.name = config['repository']['name']
-    self.trim_ansi_codes = not config['smtp'].get('use_ansi', False)
-    self.commit_msg_prefix = config['lilac'].get('commit_msg_prefix', '')
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.myaddress = config['lilac']['email']
+        self.mymaster = config['lilac']['master']
+        self.logurl_template = config['lilac'].get('logurl')
+        self.repomail = config['repository']['email']
+        self.name = config['repository']['name']
+        self.trim_ansi_codes = not config['smtp'].get('use_ansi', False)
+        self.commit_msg_prefix = config['lilac'].get('commit_msg_prefix', '')
 
-    self.repodir = Path(config['repository']['repodir']).expanduser()
-    self.bindmounts = self._get_bindmounts(config.get('bindmounts'))
-    self.tmpfs = config.get('misc', {}).get('tmpfs', [])
+        self.repodir = Path(config['repository']['repodir']).expanduser()
+        self.bindmounts = self._get_bindmounts(config.get('bindmounts'))
+        self.tmpfs = config.get('misc', {}).get('tmpfs', [])
 
-    self.ms = MailService(config)
-    github_token = config['lilac'].get('github_token')
-    if github_token:
-      self.gh = GitHub(github_token)
-    else:
-      self.gh = None
-
-    self.on_built_cmds = config.get('misc', {}).get('postbuild', [])
-
-    self.lilacinfos: LilacInfos = {}  # to be filled by self.load_all_lilac_and_report()
-    self.yamls: dict[str, Any] = {}
-    self._maint_cache: dict[str, list[Maintainer]] = {}
-
-  @lru_cache()
-  def maintainer_from_github(self, username: str) -> Optional[Maintainer]:
-    if self.gh is None:
-      raise ValueError('未设置 github token，无法从 GitHub 取得用户 Email 地址')
-
-    userinfo = self.gh.get_user_info(username)
-    if userinfo['email']:
-      return Maintainer(userinfo['name'] or username, userinfo['email'], username)
-    else:
-      return None
-
-  def parse_maintainers(
-    self,
-    ms: List[Dict[str, str]],
-  ) -> Tuple[List[Maintainer], List[str]]:
-    ret = []
-    errors = []
-
-    for m in ms:
-      if 'github' in m and 'email' in m:
-        ret.append(
-          Maintainer.from_email_address(m['email'], m['github'])
-        )
-      elif 'github' in m:
-        try:
-          u = self.maintainer_from_github(m['github'])
-        except Exception as e:
-          errors.append(f'从 GitHub 获取用户 Email 地址时出错：{e!r}')
+        self.ms = MailService(config)
+        github_token = config['lilac'].get('github_token')
+        if github_token:
+            self.gh = GitHub(github_token)
         else:
-          if u is None:
-            errors.append(f'GitHub 用户 {m["github"]} 未公开 Email 地址')
-          else:
-            ret.append(u)
-      else:
-        logger.error('unsupported maintainer info: %r', m)
-        errors.append(f'不支持的格式：{m!r}')
-        continue
+            self.gh = None
 
-    return ret, errors
+        self.on_built_cmds = config.get('misc', {}).get('postbuild', [])
 
-  def find_dependents(
-    self, pkgbase: str,
-  ) -> List[str]:
-    if self.lilacinfos:
-      return self._find_dependents_heavy(pkgbase)
-    else:
-      return self._find_dependents_lite(pkgbase)
+        # to be filled by self.load_all_lilac_and_report()
+        self.lilacinfos: LilacInfos = {}
+        self.yamls: dict[str, Any] = {}
+        self._maint_cache: dict[str, list[Maintainer]] = {}
 
-  def _find_dependents_heavy(
-    self, pkgbase: str,
-  ) -> List[str]:
-    '''find_dependents for main process'''
-    ret = []
+    @lru_cache()
+    def maintainer_from_github(self, username: str) -> Optional[Maintainer]:
+        if self.gh is None:
+            raise ValueError('未设置 github token，无法从 GitHub 取得用户 Email 地址')
 
-    for info in self.lilacinfos.values():
-      ds = info.repo_depends
-      if any(x == pkgbase for x, y in ds):
-        ret.append(info.pkgbase)
+        userinfo = self.gh.get_user_info(username)
+        if userinfo['email']:
+            return Maintainer(userinfo['name'] or username, userinfo['email'], username)
+        else:
+            return None
 
-    return ret
+    def parse_maintainers(
+        self,
+        ms: List[Dict[str, str]],
+    ) -> Tuple[List[Maintainer], List[str]]:
+        ret = []
+        errors = []
 
-  def _find_dependents_lite(
-    self, pkgbase: str,
-  ) -> List[str]:
-    '''find_dependents for worker process'''
-    ret = []
-    self._load_yamls_ignore_errors()
+        for m in ms:
+            if 'github' in m and 'email' in m:
+                ret.append(
+                    Maintainer.from_email_address(m['email'], m['github'])
+                )
+            elif 'github' in m:
+                try:
+                    u = self.maintainer_from_github(m['github'])
+                except Exception as e:
+                    errors.append(f'从 GitHub 获取用户 Email 地址时出错：{e!r}')
+                else:
+                    if u is None:
+                        errors.append(f'GitHub 用户 {m["github"]} 未公开 Email 地址')
+                    else:
+                        ret.append(u)
+            else:
+                logger.error('unsupported maintainer info: %r', m)
+                errors.append(f'不支持的格式：{m!r}')
+                continue
 
-    for p, yamlconf in self.yamls.items():
-      ds = yamlconf.get('repo_depends', ())
-      if any(x == pkgbase for x, y in ds):
-        ret.append(p)
+        return ret, errors
 
-    return ret
+    def find_dependents(
+        self, pkgbase: str,
+    ) -> List[str]:
+        if self.lilacinfos:
+            return self._find_dependents_heavy(pkgbase)
+        else:
+            return self._find_dependents_lite(pkgbase)
 
-  def _load_yamls_ignore_errors(self) -> None:
-    if self.yamls:
-      return
+    def _find_dependents_heavy(
+        self, pkgbase: str,
+    ) -> List[str]:
+        '''find_dependents for main process'''
+        ret = []
 
-    for dir in lilacyaml.iter_pkgdir(self.repodir):
-      try:
-        yamlconf = lilacyaml.load_lilac_yaml(dir)
-      except Exception:
-        pass
-      else:
-        self.yamls[dir.name] = yamlconf
+        for info in self.lilacinfos.values():
+            ds = info.repo_depends
+            if any(x == pkgbase for x, y in ds):
+                ret.append(info.pkgbase)
 
-  def find_maintainers(
-    self, mod: Union[LilacInfo, LilacMod],
-    fallback_git: bool = True,
-  ) -> List[Maintainer]:
-    if mod.pkgbase not in self._maint_cache:
-      mts = self._find_maintainers_impl(
-        mod.pkgbase,
-        maintainers = getattr(mod, 'maintainers', None),
-        fallback_git = fallback_git,
-      )
-      self._maint_cache[mod.pkgbase] = mts
-    return self._maint_cache[mod.pkgbase]
+        return ret
 
-  def _find_maintainers_impl(
-    self,
-    pkgbase: str,
-    maintainers: Optional[List[Dict[str, str]]],
-    fallback_git: bool = True,
-  ) -> List[Maintainer]:
-    ret: List[Maintainer] = []
-    errors: List[str] = []
+    def _find_dependents_lite(
+        self, pkgbase: str,
+    ) -> List[str]:
+        '''find_dependents for worker process'''
+        ret = []
+        self._load_yamls_ignore_errors()
 
-    if maintainers is not None:
-      if maintainers:
-        ret, errors = self.parse_maintainers(maintainers)
-      else:
-        dependents = self.find_dependents(pkgbase)
-        for pkg in dependents:
-          if self.lilacinfos:
-            maintainers = self.lilacinfos[pkg].maintainers
-          else:
-            maintainers = self.yamls[pkg].get('maintainers')
-          dmaints = self._find_maintainers_impl(
-            pkg, maintainers, fallback_git=False,
-          )
-          ret.extend(dmaints)
+        for p, yamlconf in self.yamls.items():
+            ds = yamlconf.get('repo_depends', ())
+            if any(x == pkgbase for x, y in ds):
+                ret.append(p)
 
-    if (not ret and fallback_git) or errors:
-      # fallback to git
-      dir = self.repodir / pkgbase
-      git_maintainer = self.find_maintainer_by_git(dir)
+        return ret
 
-    if errors:
-      error_str = '\n'.join(errors)
-      self.sendmail(
-        git_maintainer,
-        subject = f'{pkgbase} 的 maintainers 信息有误',
-        msg = f"以下 maintainers 信息有误，请修正。\n\n{error_str}\n",
-      )
+    def _load_yamls_ignore_errors(self) -> None:
+        if self.yamls:
+            return
 
-    if not ret and fallback_git:
-      logger.warning("lilac doesn't give out maintainers for %s, "
-                     "fallback to git.", pkgbase)
-      return [git_maintainer]
-    else:
-      return ret
+        for dir in lilacyaml.iter_pkgdir(self.repodir):
+            try:
+                yamlconf = lilacyaml.load_lilac_yaml(dir)
+            except Exception:
+                pass
+            else:
+                self.yamls[dir.name] = yamlconf
 
-  def find_maintainer_by_git(
-    self,
-    dir: Path = Path('.'),
-    file: str = '*',
-  ) -> Maintainer:
+    def find_maintainers(
+        self, mod: Union[LilacInfo, LilacMod],
+        fallback_git: bool = True,
+    ) -> List[Maintainer]:
+        if mod.pkgbase not in self._maint_cache:
+            mts = self._find_maintainers_impl(
+                mod.pkgbase,
+                maintainers=getattr(mod, 'maintainers', None),
+                fallback_git=fallback_git,
+            )
+            self._maint_cache[mod.pkgbase] = mts
+        return self._maint_cache[mod.pkgbase]
 
-    me = self.myaddress
+    def _find_maintainers_impl(
+        self,
+        pkgbase: str,
+        maintainers: Optional[List[Dict[str, str]]],
+        fallback_git: bool = True,
+    ) -> List[Maintainer]:
+        ret: List[Maintainer] = []
+        errors: List[str] = []
 
-    cmd = [
-      "git", "log", "--format=%H %an <%ae>", "--", file,
-    ]
-    p = subprocess.Popen(
-      cmd, stdout=subprocess.PIPE, universal_newlines=True,
-      cwd = dir,
-    )
+        if maintainers is not None:
+            if maintainers:
+                ret, errors = self.parse_maintainers(maintainers)
+            else:
+                dependents = self.find_dependents(pkgbase)
+                for pkg in dependents:
+                    if self.lilacinfos:
+                        maintainers = self.lilacinfos[pkg].maintainers
+                    else:
+                        maintainers = self.yamls[pkg].get('maintainers')
+                    dmaints = self._find_maintainers_impl(
+                        pkg, maintainers, fallback_git=False,
+                    )
+                    ret.extend(dmaints)
 
-    try:
-      stdout = p.stdout
-      assert stdout
-      while True:
-        line = stdout.readline()
-        if not line:
-          logger.error('history exhausted while finding maintainer, stop.')
-          raise Exception('maintainer cannot be found')
-        commit, author = line.rstrip().split(None, 1)
-        if me not in author:
-          return Maintainer.from_email_address(author)
-    finally:
-      p.terminate()
+        if (not ret and fallback_git) or errors:
+            # fallback to git
+            dir = self.repodir / pkgbase
+            git_maintainer = self.find_maintainer_by_git(dir)
 
-  def report_error(self, subject: str, msg: str) -> None:
-    self.ms.sendmail(self.mymaster, subject, msg)
+        if errors:
+            error_str = '\n'.join(errors)
+            self.sendmail(
+                git_maintainer,
+                subject=f'{pkgbase} 的 maintainers 信息有误',
+                msg=f"以下 maintainers 信息有误，请修正。\n\n{error_str}\n",
+            )
 
-  def send_error_report(
-    self,
-    mod: Union[LilacInfo, LilacMod, str], *,
-    msg: Optional[str] = None,
-    exc: Optional[Exception] = None,
-    subject: Optional[str] = None,
-    logfile: Optional[Path] = None,
-  ) -> None:
-    '''
-    the mod argument can be a LilacInfo, or LilacMod (for worker), or a str in case the module cannot be loaded,
-    in that case we use git to find a maintainer.
-    '''
-    if msg is None and exc is None:
-      raise TypeError('send_error_report received insufficient args')
+        if not ret and fallback_git:
+            logger.warning("lilac doesn't give out maintainers for %s, "
+                           "fallback to git.", pkgbase)
+            return [git_maintainer]
+        else:
+            return ret
 
-    if isinstance(mod, str):
-      maintainers = [self.find_maintainer_by_git(file=mod)]
-      pkgbase = mod
-    else:
-      maintainers = self.find_maintainers(mod)
-      pkgbase = mod.pkgbase
+    def find_maintainer_by_git(
+        self,
+        dir: Path = Path('.'),
+        file: str = '*',
+    ) -> Maintainer:
 
-    msgs = []
-    if msg is not None:
-      msgs.append(msg)
+        me = self.myaddress
 
-    if exc is not None:
-      tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-      if isinstance(exc, subprocess.CalledProcessError):
-        subject_real = subject or '在打包软件包 %s 时发生错误'
-        msgs.append('命令执行失败！\n\n命令 %r 返回了错误号 %d。' % (
-          exc.cmd, exc.returncode))
-        if exc.output:
-          msgs.append('命令的输出如下：\n\n%s' % exc.output)
-        msgs.append('调用栈如下：\n\n' + tb)
-      elif isinstance(exc, api.AurDownloadError):
-        subject_real = subject or '在获取AUR包 %s 时发生错误'
-        msgs.append('获取AUR包失败！\n\n')
-        msgs.append('调用栈如下：\n\n' + tb)
-      elif isinstance(exc, TimeoutError):
-        subject_real = subject or '打包软件包 %s 超时'
-      else:
-        subject_real = subject or '在打包软件包 %s 时发生未知错误'
-        msgs.append('发生未知错误！调用栈如下：\n\n' + tb)
-    else:
-      if subject is None:
-        raise ValueError('subject should be given but not')
-      subject_real = subject
+        cmd = [
+            "git", "log", "--format=%H %an <%ae>", "--", file,
+        ]
+        p = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, universal_newlines=True,
+            cwd=dir,
+        )
 
-    if '%s' in subject_real:
-      subject_real = subject_real % pkgbase
+        try:
+            stdout = p.stdout
+            assert stdout
+            while True:
+                line = stdout.readline()
+                if not line:
+                    logger.error(
+                        'history exhausted while finding maintainer, stop.')
+                    raise Exception('maintainer cannot be found')
+                commit, author = line.rstrip().split(None, 1)
+                if me not in author:
+                    return Maintainer.from_email_address(author)
+        finally:
+            p.terminate()
 
-    if logfile:
-      with suppress(FileNotFoundError):
-        # we need to replace error characters because the mail will be
-        # strictly encoded, disallowing surrogate pairs
-        with logfile.open(errors='replace') as f:
-          build_output = f.read()
-        if build_output:
-          log_header = '打包日志：'
-          with suppress(ValueError, KeyError): # invalid template or wrong key
-            if self.logurl_template and len(logfile.parts) >= 2:
-              # assume the directory name is the time stamp for now.
-              logurl = string.Template(self.logurl_template).substitute(
-                datetime = logfile.parts[-2],
-                timestamp = int(time.time()),
-                pkgbase = pkgbase,
-              )
-              log_header += ' ' + logurl
-          msgs.append(log_header)
-          msgs.append('\n' + build_output)
+    def report_error(self, subject: str, msg: str) -> None:
+        self.ms.sendmail(self.mymaster, subject, msg)
 
-    msg = '\n'.join(msgs)
-    if self.trim_ansi_codes:
-      msg = ansi_escape_re.sub('', msg)
+    def send_error_report(
+        self,
+        mod: Union[LilacInfo, LilacMod, str], *,
+        msg: Optional[str] = None,
+        exc: Optional[Exception] = None,
+        subject: Optional[str] = None,
+        logfile: Optional[Path] = None,
+    ) -> None:
+        '''
+        the mod argument can be a LilacInfo, or LilacMod (for worker), or a str in case the module cannot be loaded,
+        in that case we use git to find a maintainer.
+        '''
+        if msg is None and exc is None:
+            raise TypeError('send_error_report received insufficient args')
 
-    addresses = [str(x) for x in maintainers]
-    logger.debug('mail to %s:\nsubject: %s\nbody: %s',
-                 addresses, subject_real, msg[:200])
-    self.sendmail(addresses, subject_real, msg)
+        if isinstance(mod, str):
+            maintainers = [self.find_maintainer_by_git(file=mod)]
+            pkgbase = mod
+        else:
+            maintainers = self.find_maintainers(mod)
+            pkgbase = mod.pkgbase
 
-  def sendmail(self, who: Union[str, List[str], Maintainer],
-               subject: str, msg: str) -> None:
-    if isinstance(who, Maintainer):
-      who = str(who)
-    self.ms.sendmail(who, subject, msg)
+        msgs = []
+        if msg is not None:
+            msgs.append(msg)
 
-  def send_repo_mail(self, subject: str, msg: str) -> None:
-    self.ms.sendmail(self.repomail, subject, msg)
+        if exc is not None:
+            tb = ''.join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__))
+            if isinstance(exc, subprocess.CalledProcessError):
+                subject_real = subject or '在打包软件包 %s 时发生错误'
+                msgs.append('命令执行失败！\n\n命令 %r 返回了错误号 %d。' % (
+                    exc.cmd, exc.returncode))
+                if exc.output:
+                    msgs.append('命令的输出如下：\n\n%s' % exc.output)
+                msgs.append('调用栈如下：\n\n' + tb)
+            elif isinstance(exc, api.AurDownloadError):
+                subject_real = subject or '在获取AUR包 %s 时发生错误'
+                msgs.append('获取AUR包失败！\n\n')
+                msgs.append('调用栈如下：\n\n' + tb)
+            elif isinstance(exc, TimeoutError):
+                subject_real = subject or '打包软件包 %s 超时'
+            else:
+                subject_real = subject or '在打包软件包 %s 时发生未知错误'
+                msgs.append('发生未知错误！调用栈如下：\n\n' + tb)
+        else:
+            if subject is None:
+                raise ValueError('subject should be given but not')
+            subject_real = subject
 
-  def manages(self, dep: Dependency) -> bool:
-    return dep.pkgdir.name in self.lilacinfos
+        if '%s' in subject_real:
+            subject_real = subject_real % pkgbase
 
-  def load_managed_lilac_and_report(self) -> dict[str, tuple[str, ...]]:
-    self.lilacinfos, errors = lilacyaml.load_managed_lilacinfos(self.repodir)
-    failed: dict[str, tuple[str, ...]] = {p: () for p in errors}
-    for name, exc_info in errors.items():
-      logger.error('error while loading lilac.py for %s', name, exc_info=exc_info)
-      exc = exc_info[1]
-      if not isinstance(exc, Exception):
-        raise
-      self.send_error_report(name, exc=exc,
-                             subject='为软件包 %s 载入 lilac.py 时失败')
-      build_logger_old.error('%s failed', name)
-      build_logger.exception('lilac.py error', pkgbase = name, exc_info=exc_info)
+        if logfile:
+            with suppress(FileNotFoundError):
+                # we need to replace error characters because the mail will be
+                # strictly encoded, disallowing surrogate pairs
+                with logfile.open(errors='replace') as f:
+                    build_output = f.read()
+                if build_output:
+                    log_header = '打包日志：'
+                    with suppress(ValueError, KeyError):  # invalid template or wrong key
+                        if self.logurl_template and len(logfile.parts) >= 2:
+                            # assume the directory name is the time stamp for now.
+                            logurl = string.Template(self.logurl_template).substitute(
+                                datetime=logfile.parts[-2],
+                                timestamp=int(time.time()),
+                                pkgbase=pkgbase,
+                            )
+                            log_header += ' ' + logurl
+                    msgs.append(log_header)
+                    msgs.append('\n' + build_output)
 
-    return failed
+        msg = '\n'.join(msgs)
+        if self.trim_ansi_codes:
+            msg = ansi_escape_re.sub('', msg)
 
-  def on_built(self, pkg: str, result: BuildResult, version: Optional[str]) -> None:
-    if not self.on_built_cmds:
-      return
+        addresses = [str(x) for x in maintainers]
+        logger.debug('mail to %s:\nsubject: %s\nbody: %s',
+                     addresses, subject_real, msg[:200])
+        self.sendmail(addresses, subject_real, msg)
 
-    env = os.environ.copy()
-    env['PKGBASE'] = pkg
-    env['RESULT'] = result.__class__.__name__
-    env['VERSION'] = version or ''
-    for cmd in self.on_built_cmds:
-      try:
-        subprocess.check_call(cmd, env=env)
-      except Exception:
-        logger.exception('postbuild cmd error for %r', cmd)
+    def sendmail(self, who: Union[str, List[str], Maintainer],
+                 subject: str, msg: str) -> None:
+        if isinstance(who, Maintainer):
+            who = str(who)
+        self.ms.sendmail(who, subject, msg)
 
-  def _get_bindmounts(
-    self, bindmounts: Optional[dict[str, str]],
-  ) -> list[str]:
-    if bindmounts is None:
-      return []
+    def send_repo_mail(self, subject: str, msg: str) -> None:
+        self.ms.sendmail(self.repomail, subject, msg)
 
-    items = [(os.path.expanduser(src), dst)
-            for src, dst in bindmounts.items()]
-    items.sort(reverse=True)
-    return [f'{src}:{dst}' for src, dst in items]
+    def manages(self, dep: Dependency) -> bool:
+        return dep.pkgdir.name in self.lilacinfos
+
+    def load_managed_lilac_and_report(self) -> dict[str, tuple[str, ...]]:
+        self.lilacinfos, errors = lilacyaml.load_managed_lilacinfos(
+            self.repodir)
+        failed: dict[str, tuple[str, ...]] = {p: () for p in errors}
+        for name, exc_info in errors.items():
+            logger.error('error while loading lilac.py for %s',
+                         name, exc_info=exc_info)
+            exc = exc_info[1]
+            if not isinstance(exc, Exception):
+                raise
+            self.send_error_report(name, exc=exc,
+                                   subject='为软件包 %s 载入 lilac.py 时失败')
+            build_logger_old.error('%s failed', name)
+            build_logger.exception(
+                'lilac.py error', pkgbase=name, exc_info=exc_info)
+
+        return failed
+
+    def on_built(self, pkg: str, result: BuildResult, version: Optional[str]) -> None:
+        if not self.on_built_cmds:
+            return
+
+        env = os.environ.copy()
+        env['PKGBASE'] = pkg
+        env['RESULT'] = result.__class__.__name__
+        env['VERSION'] = version or ''
+        for cmd in self.on_built_cmds:
+            try:
+                subprocess.check_call(cmd, env=env)
+            except Exception:
+                logger.exception('postbuild cmd error for %r', cmd)
+
+    def _get_bindmounts(
+        self, bindmounts: Optional[dict[str, str]],
+    ) -> list[str]:
+        if bindmounts is None:
+            return []
+
+        items = [(os.path.expanduser(src), dst)
+                 for src, dst in bindmounts.items()]
+        items.sort(reverse=True)
+        return [f'{src}:{dst}' for src, dst in items]
